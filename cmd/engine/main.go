@@ -16,14 +16,14 @@ import (
 )
 
 type Engine struct {
-	books   map[string]*matching.OrderBook
-	gateway *gateway.Gateway
-	redis   *storage.RedisTradeWriter
+	registry *matching.BookRegistry
+	gateway  *gateway.Gateway
+	redis    *storage.RedisTradeWriter
 }
 
 func NewEngine(redisAddr, redisPassword string, redisDB int, listenAddr string) *Engine {
 	e := &Engine{
-		books: make(map[string]*matching.OrderBook),
+		registry: matching.NewBookRegistry(),
 	}
 
 	e.redis = storage.NewRedisTradeWriter(redisAddr, redisPassword, redisDB)
@@ -34,20 +34,18 @@ func NewEngine(redisAddr, redisPassword string, redisDB int, listenAddr string) 
 }
 
 func (e *Engine) getOrCreateBook(symbol string) *matching.OrderBook {
-	if book, ok := e.books[symbol]; ok {
+	return e.registry.GetOrCreate(symbol, func() *matching.OrderBook {
+		book := matching.NewOrderBook(symbol)
+		book.SetTradeListener(func(trade *matching.Trade) {
+			if err := e.redis.WriteTrade(trade); err != nil {
+				log.Printf("[Engine] Redis write error: %v", err)
+			}
+			log.Printf("[Engine] Trade: %s %s Price=%.4f Qty=%d Buyer=%s Seller=%s",
+				trade.TradeID, trade.Symbol, trade.Price, trade.Quantity,
+				trade.BuyOrderID, trade.SellOrderID)
+		})
 		return book
-	}
-	book := matching.NewOrderBook(symbol)
-	book.SetTradeListener(func(trade *matching.Trade) {
-		if err := e.redis.WriteTrade(trade); err != nil {
-			log.Printf("[Engine] Redis write error: %v", err)
-		}
-		log.Printf("[Engine] Trade: %s %s Price=%.4f Qty=%d Buyer=%s Seller=%s",
-			trade.TradeID, trade.Symbol, trade.Price, trade.Quantity,
-			trade.BuyOrderID, trade.SellOrderID)
 	})
-	e.books[symbol] = book
-	return book
 }
 
 func (e *Engine) handleMessage(msg *fix.Message, conn net.Conn) {
@@ -104,6 +102,12 @@ func (e *Engine) handleNewOrder(msg *fix.Message, conn net.Conn, connID string) 
 
 	book := e.getOrCreateBook(order.Symbol)
 
+	ordType := int(order.OrdType)
+	isIceberg := order.OrdType == fix.OrdTypeIceberg || order.MaxFloor > 0
+	if isIceberg {
+		ordType = matching.OrdTypeIceberg
+	}
+
 	internalOrder := &matching.Order{
 		ID:        order.ClOrdID,
 		Symbol:    order.Symbol,
@@ -111,9 +115,12 @@ func (e *Engine) handleNewOrder(msg *fix.Message, conn net.Conn, connID string) 
 		Price:     order.Price,
 		Quantity:  order.OrderQty,
 		Remaining: order.OrderQty,
-		OrdType:   int(order.OrdType),
+		OrdType:   ordType,
 		Timestamp: time.Now().UnixNano(),
 		ConnID:    connID,
+
+		MaxFloor:  order.MaxFloor,
+		IsIceberg: isIceberg,
 	}
 
 	start := time.Now()
@@ -135,25 +142,29 @@ func (e *Engine) handleNewOrder(msg *fix.Message, conn net.Conn, connID string) 
 		}
 
 		e.gateway.SendExecutionReport(conn, connID, order.ClOrdID, order.Symbol,
-			int(order.Side), int(order.OrdType), order.Price, order.OrderQty,
+			int(order.Side), ordType, order.Price, order.OrderQty,
 			cumQty, avgPrice, "F", "1")
 
-		if internalOrder.Remaining == 0 {
+		if internalOrder.Remaining == 0 && !isIceberg {
 			e.gateway.SendExecutionReport(conn, connID, order.ClOrdID, order.Symbol,
-				int(order.Side), int(order.OrdType), order.Price, order.OrderQty,
+				int(order.Side), ordType, order.Price, order.OrderQty,
 				cumQty, avgPrice, "F", "2")
 		}
 	}
 
-	if internalOrder.Remaining > 0 && internalOrder.OrdType == 2 {
+	if internalOrder.Remaining > 0 && (ordType == matching.OrdTypeLimit || ordType == matching.OrdTypeIceberg) {
 		e.gateway.SendExecutionReport(conn, connID, order.ClOrdID, order.Symbol,
-			int(order.Side), int(order.OrdType), order.Price, order.OrderQty,
+			int(order.Side), ordType, order.Price, order.OrderQty,
 			order.OrderQty-internalOrder.Remaining, order.Price, "0", "0")
 	}
 
-	log.Printf("[Engine] Order %s %s Side=%d Type=%d Price=%.4f Qty=%d Matched=%d Latency=%s",
-		order.ClOrdID, order.Symbol, order.Side, order.OrdType, order.Price,
-		order.OrderQty, len(trades), elapsed)
+	icebergTag := ""
+	if isIceberg {
+		icebergTag = " [ICEBERG]"
+	}
+	log.Printf("[Engine] Order %s %s Side=%d Type=%d%s Price=%.4f Qty=%d MaxFloor=%d Matched=%d Latency=%s",
+		order.ClOrdID, order.Symbol, order.Side, ordType, icebergTag,
+		order.Price, order.OrderQty, order.MaxFloor, len(trades), elapsed)
 
 	if elapsed > time.Millisecond {
 		log.Printf("[Engine] WARNING: Matching latency exceeded 1ms: %s", elapsed)
@@ -167,7 +178,7 @@ func (e *Engine) handleCancel(msg *fix.Message, conn net.Conn, connID string) {
 		return
 	}
 
-	book, ok := e.books[cancel.Symbol]
+	book, ok := e.registry.Get(cancel.Symbol)
 	if !ok {
 		log.Printf("[Engine] Cancel rejected: no book for %s", cancel.Symbol)
 		return
@@ -193,6 +204,7 @@ func (e *Engine) Start() error {
 func (e *Engine) Stop() {
 	log.Println("[Engine] Shutting down...")
 	e.gateway.Stop()
+	e.registry.StopAll()
 	if e.redis != nil {
 		e.redis.Close()
 	}

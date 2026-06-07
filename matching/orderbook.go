@@ -9,38 +9,129 @@ import (
 )
 
 type Trade struct {
-	TradeID    string
-	Symbol     string
-	Price      float64
-	Quantity   int64
-	BuyOrderID string
+	TradeID     string
+	Symbol      string
+	Price       float64
+	Quantity    int64
+	BuyOrderID  string
 	SellOrderID string
-	Timestamp  int64
+	Timestamp   int64
 }
 
 type TradeListener func(trade *Trade)
 
-type OrderBook struct {
-	Symbol      string
-	Bids        *RBTree
-	Asks        *RBTree
-	orderMap    map[string]*orderLocation
-	mu          sync.RWMutex
-	tradeListener TradeListener
-	orderSeq    atomic.Int64
+const (
+	cmdAdd    = 1
+	cmdCancel = 2
+)
+
+type command struct {
+	op      int
+	order   *Order
+	orderID string
+	result  chan *cmdResult
+}
+
+type cmdResult struct {
+	trades []*Trade
+	ok     bool
+}
+
+type priceSnapshot struct {
+	Price float64
+	Valid bool
 }
 
 type orderLocation struct {
-	Price float64
-	Side  int
+	Price     float64
+	Side      int
+	HiddenQty int64
+	MaxFloor  int64
+	IsIceberg bool
+}
+
+type OrderBook struct {
+	Symbol       string
+	bids         *RBTree
+	asks         *RBTree
+	orderMap     map[string]*orderLocation
+	cmdCh        chan *command
+	done         chan struct{}
+	tradeListener TradeListener
+	orderSeq     int64
+	bestBidVal   atomic.Value
+	bestAskVal   atomic.Value
+	running      atomic.Bool
 }
 
 func NewOrderBook(symbol string) *OrderBook {
-	return &OrderBook{
+	ob := &OrderBook{
 		Symbol:   symbol,
-		Bids:     NewRBTree(false),
-		Asks:     NewRBTree(true),
+		bids:     NewRBTree(false),
+		asks:     NewRBTree(true),
 		orderMap: make(map[string]*orderLocation),
+		cmdCh:    make(chan *command, 65536),
+		done:     make(chan struct{}),
+	}
+
+	ob.bestBidVal.Store(priceSnapshot{Valid: false})
+	ob.bestAskVal.Store(priceSnapshot{Valid: false})
+
+	ob.running.Store(true)
+	go ob.eventLoop()
+
+	return ob
+}
+
+func (ob *OrderBook) eventLoop() {
+	for ob.running.Load() {
+		cmd, ok := <-ob.cmdCh
+		if !ok {
+			return
+		}
+		switch cmd.op {
+		case cmdAdd:
+			trades := ob.processAdd(cmd.order)
+			cmd.result <- &cmdResult{trades: trades}
+		case cmdCancel:
+			ok := ob.processCancel(cmd.orderID)
+			cmd.result <- &cmdResult{ok: ok}
+		}
+	}
+}
+
+func (ob *OrderBook) AddOrder(order *Order) []*Trade {
+	if !ob.running.Load() {
+		return nil
+	}
+	cmd := &command{
+		op:     cmdAdd,
+		order:  order,
+		result: make(chan *cmdResult, 1),
+	}
+	ob.cmdCh <- cmd
+	result := <-cmd.result
+	return result.trades
+}
+
+func (ob *OrderBook) CancelOrder(orderID string) bool {
+	if !ob.running.Load() {
+		return false
+	}
+	cmd := &command{
+		op:      cmdCancel,
+		orderID: orderID,
+		result:  make(chan *cmdResult, 1),
+	}
+	ob.cmdCh <- cmd
+	result := <-cmd.result
+	return result.ok
+}
+
+func (ob *OrderBook) Stop() {
+	if ob.running.CompareAndSwap(true, false) {
+		close(ob.cmdCh)
+		close(ob.done)
 	}
 }
 
@@ -48,29 +139,41 @@ func (ob *OrderBook) SetTradeListener(listener TradeListener) {
 	ob.tradeListener = listener
 }
 
-func (ob *OrderBook) AddOrder(order *Order) []*Trade {
-	ob.mu.Lock()
-	defer ob.mu.Unlock()
+func (ob *OrderBook) nextSeq() int64 {
+	ob.orderSeq++
+	return ob.orderSeq
+}
 
+func (ob *OrderBook) processAdd(order *Order) []*Trade {
 	if order.ID == "" {
-		order.ID = fmt.Sprintf("ORD-%d", ob.orderSeq.Add(1))
+		order.ID = fmt.Sprintf("ORD-%d", ob.nextSeq())
 	}
 	if order.Timestamp == 0 {
 		order.Timestamp = time.Now().UnixNano()
 	}
-	order.Remaining = order.Quantity
+
+	if order.IsIceberg && order.MaxFloor > 0 && order.Quantity > order.MaxFloor {
+		order.HiddenQty = order.Quantity - order.MaxFloor
+		order.Remaining = order.MaxFloor
+	} else {
+		order.Remaining = order.Quantity
+		order.HiddenQty = 0
+	}
 
 	var trades []*Trade
 
-	if order.Side == 1 {
+	if order.Side == SideBuy {
 		trades = ob.matchBuyOrder(order)
 	} else {
 		trades = ob.matchSellOrder(order)
 	}
 
-	if order.Remaining > 0 && order.OrdType == 2 {
+	if order.Remaining > 0 && (order.OrdType == OrdTypeLimit || order.OrdType == OrdTypeIceberg) {
 		ob.insertRemaining(order)
 	}
+
+	ob.updateBestBidSnapshot()
+	ob.updateBestAskSnapshot()
 
 	return trades
 }
@@ -78,14 +181,14 @@ func (ob *OrderBook) AddOrder(order *Order) []*Trade {
 func (ob *OrderBook) matchBuyOrder(order *Order) []*Trade {
 	var trades []*Trade
 
-	for order.Remaining > 0 && !ob.Asks.IsEmpty() {
-		bestAsks := ob.Asks.BestOrders()
+	for order.Remaining > 0 && !ob.asks.IsEmpty() {
+		bestAsks := ob.asks.BestOrders()
 		if bestAsks == nil || bestAsks.Size == 0 {
 			break
 		}
 
-		bestAskPrice, _ := ob.Asks.BestPrice()
-		if order.OrdType == 2 && order.Price < bestAskPrice {
+		bestAskPrice, _ := ob.asks.BestPrice()
+		if (order.OrdType == OrdTypeLimit || order.OrdType == OrdTypeIceberg) && order.Price < bestAskPrice {
 			break
 		}
 
@@ -101,7 +204,7 @@ func (ob *OrderBook) matchBuyOrder(order *Order) []*Trade {
 			}
 
 			trade := &Trade{
-				TradeID:     fmt.Sprintf("TRD-%d", ob.orderSeq.Add(1)),
+				TradeID:     fmt.Sprintf("TRD-%d", ob.nextSeq()),
 				Symbol:      ob.Symbol,
 				Price:       counterOrder.Price,
 				Quantity:    tradeQty,
@@ -115,16 +218,20 @@ func (ob *OrderBook) matchBuyOrder(order *Order) []*Trade {
 			counterOrder.Remaining -= tradeQty
 
 			if counterOrder.Remaining == 0 {
-				ob.Asks.PopBestOrder()
-				delete(ob.orderMap, counterOrder.ID)
+				ob.asks.PopBestOrder()
+				if counterOrder.IsIceberg && counterOrder.HiddenQty > 0 {
+					ob.replenishIceberg(counterOrder)
+				} else {
+					delete(ob.orderMap, counterOrder.ID)
+				}
 			}
 		}
 
 		if bestAsks.Size == 0 {
-			bestPrice, _ := ob.Asks.BestPrice()
-			node := ob.Asks.Find(bestPrice)
+			bestPrice, _ := ob.asks.BestPrice()
+			node := ob.asks.Find(bestPrice)
 			if node != nil && node.isEmpty() {
-				ob.Asks.deleteNode(node)
+				ob.asks.deleteNode(node)
 			}
 		}
 	}
@@ -135,14 +242,14 @@ func (ob *OrderBook) matchBuyOrder(order *Order) []*Trade {
 func (ob *OrderBook) matchSellOrder(order *Order) []*Trade {
 	var trades []*Trade
 
-	for order.Remaining > 0 && !ob.Bids.IsEmpty() {
-		bestBids := ob.Bids.BestOrders()
+	for order.Remaining > 0 && !ob.bids.IsEmpty() {
+		bestBids := ob.bids.BestOrders()
 		if bestBids == nil || bestBids.Size == 0 {
 			break
 		}
 
-		bestBidPrice, _ := ob.Bids.BestPrice()
-		if order.OrdType == 2 && order.Price > bestBidPrice {
+		bestBidPrice, _ := ob.bids.BestPrice()
+		if (order.OrdType == OrdTypeLimit || order.OrdType == OrdTypeIceberg) && order.Price > bestBidPrice {
 			break
 		}
 
@@ -158,7 +265,7 @@ func (ob *OrderBook) matchSellOrder(order *Order) []*Trade {
 			}
 
 			trade := &Trade{
-				TradeID:     fmt.Sprintf("TRD-%d", ob.orderSeq.Add(1)),
+				TradeID:     fmt.Sprintf("TRD-%d", ob.nextSeq()),
 				Symbol:      ob.Symbol,
 				Price:       counterOrder.Price,
 				Quantity:    tradeQty,
@@ -172,16 +279,20 @@ func (ob *OrderBook) matchSellOrder(order *Order) []*Trade {
 			counterOrder.Remaining -= tradeQty
 
 			if counterOrder.Remaining == 0 {
-				ob.Bids.PopBestOrder()
-				delete(ob.orderMap, counterOrder.ID)
+				ob.bids.PopBestOrder()
+				if counterOrder.IsIceberg && counterOrder.HiddenQty > 0 {
+					ob.replenishIceberg(counterOrder)
+				} else {
+					delete(ob.orderMap, counterOrder.ID)
+				}
 			}
 		}
 
 		if bestBids.Size == 0 {
-			bestPrice, _ := ob.Bids.BestPrice()
-			node := ob.Bids.Find(bestPrice)
+			bestPrice, _ := ob.bids.BestPrice()
+			node := ob.bids.Find(bestPrice)
 			if node != nil && node.isEmpty() {
-				ob.Bids.deleteNode(node)
+				ob.bids.deleteNode(node)
 			}
 		}
 	}
@@ -189,62 +300,117 @@ func (ob *OrderBook) matchSellOrder(order *Order) []*Trade {
 	return trades
 }
 
-func (ob *OrderBook) insertRemaining(order *Order) {
-	loc := &orderLocation{Price: order.Price, Side: order.Side}
-	ob.orderMap[order.ID] = loc
+func (ob *OrderBook) replenishIceberg(order *Order) {
+	sliceQty := order.MaxFloor
+	if order.HiddenQty < sliceQty {
+		sliceQty = order.HiddenQty
+	}
+	order.HiddenQty -= sliceQty
+	order.Remaining = sliceQty
+	order.Timestamp = time.Now().UnixNano()
 
-	if order.Side == 1 {
-		ob.Bids.Insert(order.Price, order)
+	ob.bids = ob.rebuildTreeIfNeeded(ob.bids, false)
+	ob.asks = ob.rebuildTreeIfNeeded(ob.asks, true)
+
+	if order.Side == SideBuy {
+		ob.bids.Insert(order.Price, order)
 	} else {
-		ob.Asks.Insert(order.Price, order)
+		ob.asks.Insert(order.Price, order)
+	}
+
+	loc, exists := ob.orderMap[order.ID]
+	if exists {
+		loc.HiddenQty = order.HiddenQty
 	}
 }
 
-func (ob *OrderBook) CancelOrder(orderID string) bool {
-	ob.mu.Lock()
-	defer ob.mu.Unlock()
+func (ob *OrderBook) rebuildTreeIfNeeded(tree *RBTree, ascending bool) *RBTree {
+	return tree
+}
 
+func (ob *OrderBook) insertRemaining(order *Order) {
+	loc := &orderLocation{
+		Price:     order.Price,
+		Side:      order.Side,
+		HiddenQty: order.HiddenQty,
+		MaxFloor:  order.MaxFloor,
+		IsIceberg: order.IsIceberg,
+	}
+	ob.orderMap[order.ID] = loc
+
+	if order.Side == SideBuy {
+		ob.bids.Insert(order.Price, order)
+	} else {
+		ob.asks.Insert(order.Price, order)
+	}
+}
+
+func (ob *OrderBook) processCancel(orderID string) bool {
 	loc, ok := ob.orderMap[orderID]
 	if !ok {
 		return false
 	}
 
-	if loc.Side == 1 {
-		ob.Bids.RemoveOrder(loc.Price, orderID)
+	var tree *RBTree
+	if loc.Side == SideBuy {
+		tree = ob.bids
 	} else {
-		ob.Asks.RemoveOrder(loc.Price, orderID)
+		tree = ob.asks
 	}
+
+	removed := tree.RemoveOrder(loc.Price, orderID)
+	if !removed {
+		delete(ob.orderMap, orderID)
+		return false
+	}
+
+	if loc.IsIceberg && loc.HiddenQty > 0 {
+		loc.HiddenQty = 0
+	}
+
 	delete(ob.orderMap, orderID)
+
+	ob.updateBestBidSnapshot()
+	ob.updateBestAskSnapshot()
+
 	return true
 }
 
-func (ob *OrderBook) GetBestBid() (float64, bool) {
-	ob.mu.RLock()
-	defer ob.mu.RUnlock()
-	if ob.Bids.IsEmpty() {
-		return 0, false
+func (ob *OrderBook) updateBestBidSnapshot() {
+	if ob.bids.IsEmpty() {
+		ob.bestBidVal.Store(priceSnapshot{Valid: false})
+	} else {
+		price, _ := ob.bids.BestPrice()
+		ob.bestBidVal.Store(priceSnapshot{Price: price, Valid: true})
 	}
-	return ob.Bids.BestPrice()
+}
+
+func (ob *OrderBook) updateBestAskSnapshot() {
+	if ob.asks.IsEmpty() {
+		ob.bestAskVal.Store(priceSnapshot{Valid: false})
+	} else {
+		price, _ := ob.asks.BestPrice()
+		ob.bestAskVal.Store(priceSnapshot{Price: price, Valid: true})
+	}
+}
+
+func (ob *OrderBook) GetBestBid() (float64, bool) {
+	snap := ob.bestBidVal.Load().(priceSnapshot)
+	return snap.Price, snap.Valid
 }
 
 func (ob *OrderBook) GetBestAsk() (float64, bool) {
-	ob.mu.RLock()
-	defer ob.mu.RUnlock()
-	if ob.Asks.IsEmpty() {
-		return 0, false
-	}
-	return ob.Asks.BestPrice()
+	snap := ob.bestAskVal.Load().(priceSnapshot)
+	return snap.Price, snap.Valid
 }
 
 func (ob *OrderBook) GetSpread() (float64, bool) {
-	ob.mu.RLock()
-	defer ob.mu.RUnlock()
-	bid, ok1 := ob.Bids.BestPrice()
-	ask, ok2 := ob.Asks.BestPrice()
-	if !ok1 || !ok2 {
+	bidSnap := ob.bestBidVal.Load().(priceSnapshot)
+	askSnap := ob.bestAskVal.Load().(priceSnapshot)
+	if !bidSnap.Valid || !askSnap.Valid {
 		return 0, false
 	}
-	return ask - bid, true
+	return askSnap.Price - bidSnap.Price, true
 }
 
 func (ob *OrderBook) ProcessTrades(trades []*Trade) {
@@ -257,14 +423,11 @@ func (ob *OrderBook) ProcessTrades(trades []*Trade) {
 }
 
 func (ob *OrderBook) PrintBook() {
-	ob.mu.RLock()
-	defer ob.mu.RUnlock()
-
 	log.Printf("=== Order Book: %s ===", ob.Symbol)
 	log.Printf("--- Asks (ascending) ---")
-	ob.printTree(ob.Asks.Root, ob.Asks)
+	ob.printTree(ob.asks.Root, ob.asks)
 	log.Printf("--- Bids (descending) ---")
-	ob.printTree(ob.Bids.Root, ob.Bids)
+	ob.printTree(ob.bids.Root, ob.bids)
 }
 
 func (ob *OrderBook) printTree(node *RBNode, tree *RBTree) {
@@ -276,6 +439,93 @@ func (ob *OrderBook) printTree(node *RBNode, tree *RBTree) {
 	if node.Color {
 		color = "R"
 	}
-	log.Printf("  Price=%.4f [%s] Orders=%d", node.Price, color, node.Orders.Size)
+	suffix := ""
+	cur := node.Orders.Head
+	for cur != nil {
+		if cur.Order.IsIceberg {
+			suffix = fmt.Sprintf(" [ICEBERG display=%d hidden=%d]", cur.Order.Remaining, cur.Order.HiddenQty)
+			break
+		}
+		cur = cur.Next
+	}
+	log.Printf("  Price=%.4f [%s] Orders=%d%s", node.Price, color, node.Orders.Size, suffix)
 	ob.printTree(node.Right, tree)
+}
+
+const NumStripes = 64
+
+type StripedLock struct {
+	locks [NumStripes]sync.Mutex
+}
+
+func NewStripedLock() *StripedLock {
+	return &StripedLock{}
+}
+
+func fnvHash64(s string) uint64 {
+	h := uint64(14695981039346656037)
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= 1099511628211
+	}
+	return h
+}
+
+func (sl *StripedLock) Lock(key string) {
+	stripe := fnvHash64(key) % NumStripes
+	sl.locks[stripe].Lock()
+}
+
+func (sl *StripedLock) Unlock(key string) {
+	stripe := fnvHash64(key) % NumStripes
+	sl.locks[stripe].Unlock()
+}
+
+type BookRegistry struct {
+	books   sync.Map
+	stripes *StripedLock
+}
+
+func NewBookRegistry() *BookRegistry {
+	return &BookRegistry{
+		stripes: NewStripedLock(),
+	}
+}
+
+func (br *BookRegistry) GetOrCreate(symbol string, factory func() *OrderBook) *OrderBook {
+	if val, ok := br.books.Load(symbol); ok {
+		return val.(*OrderBook)
+	}
+
+	br.stripes.Lock(symbol)
+	defer br.stripes.Unlock(symbol)
+
+	if val, ok := br.books.Load(symbol); ok {
+		return val.(*OrderBook)
+	}
+
+	book := factory()
+	br.books.Store(symbol, book)
+	return book
+}
+
+func (br *BookRegistry) Get(symbol string) (*OrderBook, bool) {
+	val, ok := br.books.Load(symbol)
+	if !ok {
+		return nil, false
+	}
+	return val.(*OrderBook), true
+}
+
+func (br *BookRegistry) Range(fn func(symbol string, book *OrderBook) bool) {
+	br.books.Range(func(key, value interface{}) bool {
+		return fn(key.(string), value.(*OrderBook))
+	})
+}
+
+func (br *BookRegistry) StopAll() {
+	br.books.Range(func(key, value interface{}) bool {
+		value.(*OrderBook).Stop()
+		return true
+	})
 }

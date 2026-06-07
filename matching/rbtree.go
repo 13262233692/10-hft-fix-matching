@@ -5,6 +5,17 @@ const (
 	Black = false
 )
 
+const (
+	SideBuy  = 1
+	SideSell = 2
+)
+
+const (
+	OrdTypeMarket  = 1
+	OrdTypeLimit   = 2
+	OrdTypeIceberg = 3
+)
+
 type Order struct {
 	ID        string
 	Symbol    string
@@ -15,6 +26,10 @@ type Order struct {
 	OrdType   int
 	Timestamp int64
 	ConnID    string
+
+	MaxFloor  int64
+	HiddenQty int64
+	IsIceberg bool
 }
 
 type OrderNode struct {
@@ -80,13 +95,13 @@ func (ol *OrderList) PopFirst() *Order {
 }
 
 type RBNode struct {
-	Price    float64
-	Orders   *OrderList
-	Color    bool
-	Left     *RBNode
-	Right    *RBNode
-	Parent   *RBNode
-	nodeMap  map[string]*OrderNode
+	Price   float64
+	Orders  *OrderList
+	Color   bool
+	Left    *RBNode
+	Right   *RBNode
+	Parent  *RBNode
+	nodeMap map[string]*OrderNode
 }
 
 func newRBNode(price float64) *RBNode {
@@ -103,13 +118,14 @@ func (n *RBNode) addOrder(order *Order) {
 	n.nodeMap[order.ID] = on
 }
 
-func (n *RBNode) removeOrder(orderID string) {
+func (n *RBNode) removeOrder(orderID string) bool {
 	on, ok := n.nodeMap[orderID]
 	if !ok {
-		return
+		return false
 	}
 	n.Orders.Remove(on)
 	delete(n.nodeMap, orderID)
+	return true
 }
 
 func (n *RBNode) isEmpty() bool {
@@ -283,15 +299,19 @@ func (t *RBTree) Find(price float64) *RBNode {
 	return nil
 }
 
-func (t *RBTree) RemoveOrder(price float64, orderID string) {
+func (t *RBTree) RemoveOrder(price float64, orderID string) bool {
 	node := t.Find(price)
 	if node == nil {
-		return
+		return false
 	}
-	node.removeOrder(orderID)
+	removed := node.removeOrder(orderID)
+	if !removed {
+		return false
+	}
 	if node.isEmpty() {
 		t.deleteNode(node)
 	}
+	return true
 }
 
 func (t *RBTree) deleteNode(z *RBNode) {

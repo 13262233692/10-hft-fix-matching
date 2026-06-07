@@ -28,6 +28,7 @@ const (
 	TagEncryptMethod = 98
 	TagHeartBtInt    = 108
 	TagPassword      = 554
+	TagMaxFloor      = 111
 
 	MsgTypeLogon        = "A"
 	MsgTypeNewOrderSingle = "D"
@@ -47,8 +48,9 @@ const (
 type OrdType int
 
 const (
-	OrdTypeMarket OrdType = 1
-	OrdTypeLimit  OrdType = 2
+	OrdTypeMarket  OrdType = 1
+	OrdTypeLimit   OrdType = 2
+	OrdTypeIceberg OrdType = 3
 )
 
 type Message struct {
@@ -71,6 +73,7 @@ type NewOrderSingle struct {
 	OrdType  OrdType
 	Price    float64
 	OrderQty int64
+	MaxFloor int64
 }
 
 type OrderCancelRequest struct {
@@ -242,6 +245,15 @@ func DecodeNewOrderSingle(msg *Message) (*NewOrderSingle, error) {
 		return nil, fmt.Errorf("OrderQty required: %w", err)
 	}
 	o.OrderQty = qty
+
+	maxFloor, err := msg.GetInt64(TagMaxFloor)
+	if err == nil && maxFloor > 0 {
+		o.MaxFloor = maxFloor
+		o.OrdType = OrdTypeIceberg
+		if o.Price == 0 {
+			return nil, fmt.Errorf("Price required for iceberg order")
+		}
+	}
 
 	return o, nil
 }
